@@ -578,6 +578,32 @@ func TestPodLifeTime(t *testing.T) {
 			},
 		},
 		{
+			description: "1 pod with pod status phase v1.PodSucceeded should be evicted",
+			args: &PodLifeTimeArgs{
+				MaxPodLifeTimeSeconds: &maxLifeTime,
+				States:                []string{string(v1.PodSucceeded)},
+			},
+			pods:                    []*v1.Pod{p16},
+			nodes:                   []*v1.Node{node1},
+			expectedEvictedPodCount: 1,
+			applyPodsFunc: func(pods []*v1.Pod) {
+				pods[0].Status.Phase = v1.PodSucceeded
+			},
+		},
+		{
+			description: "1 pod with pod status phase v1.PodUnknown should be evicted",
+			args: &PodLifeTimeArgs{
+				MaxPodLifeTimeSeconds: &maxLifeTime,
+				States:                []string{string(v1.PodFailed)},
+			},
+			pods:                    []*v1.Pod{p16},
+			nodes:                   []*v1.Node{node1},
+			expectedEvictedPodCount: 1,
+			applyPodsFunc: func(pods []*v1.Pod) {
+				pods[0].Status.Phase = v1.PodFailed
+			},
+		},
+		{
 			description: "1 pod with pod status phase v1.PodUnknown should be evicted",
 			args: &PodLifeTimeArgs{
 				MaxPodLifeTimeSeconds: &maxLifeTime,
@@ -643,7 +669,7 @@ func TestPodLifeTime(t *testing.T) {
 				t.Fatalf("Unable to initialize a framework handle: %v", err)
 			}
 
-			plugin, err := New(tc.args, handle)
+			plugin, err := New(ctx, tc.args, handle)
 			if err != nil {
 				t.Fatalf("Unable to initialize the plugin: %v", err)
 			}

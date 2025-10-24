@@ -351,12 +351,13 @@ func (d *descheduler) runDeschedulerLoop(ctx context.Context, nodes []*v1.Node) 
 	defer span.End()
 	defer func(loopStartDuration time.Time) {
 		metrics.DeschedulerLoopDuration.With(map[string]string{}).Observe(time.Since(loopStartDuration).Seconds())
+		metrics.LoopDuration.With(map[string]string{}).Observe(time.Since(loopStartDuration).Seconds())
 	}(time.Now())
 
 	// if len is still <= 1 error out
 	if len(nodes) <= 1 {
-		klog.V(1).InfoS("The cluster size is 0 or 1 meaning eviction causes service disruption or degradation. So aborting..")
-		return fmt.Errorf("the cluster size is 0 or 1")
+		klog.InfoS("Skipping descheduling cycle: requires >=2 nodes", "found", len(nodes))
+		return nil // gracefully skip this cycle instead of aborting
 	}
 
 	var client clientset.Interface
@@ -415,6 +416,7 @@ func (d *descheduler) runProfiles(ctx context.Context, client clientset.Interfac
 	var profileRunners []profileRunner
 	for _, profile := range d.deschedulerPolicy.Profiles {
 		currProfile, err := frameworkprofile.NewProfile(
+			ctx,
 			profile,
 			pluginregistry.PluginRegistry,
 			frameworkprofile.WithClientSet(client),

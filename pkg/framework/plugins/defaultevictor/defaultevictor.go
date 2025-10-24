@@ -14,15 +14,12 @@ limitations under the License.
 package defaultevictor
 
 import (
-	// "context"
 	"context"
 	"errors"
 	"fmt"
-	"time"
+	"slices"
 
 	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/tools/cache"
@@ -50,6 +47,7 @@ type constraint func(pod *v1.Pod) error
 // This plugin is only meant to customize other actions (extension points) of the evictor,
 // like filtering, sorting, and other ones that might be relevant in the future
 type DefaultEvictor struct {
+	logger      klog.Logger
 	args        *DefaultEvictorArgs
 	constraints []constraint
 	handle      frameworktypes.Handle
@@ -68,150 +66,238 @@ func HaveEvictAnnotation(pod *v1.Pod) bool {
 
 // New builds plugin from its arguments while passing a handle
 // nolint: gocyclo
-func New(args runtime.Object, handle frameworktypes.Handle) (frameworktypes.Plugin, error) {
+func New(ctx context.Context, args runtime.Object, handle frameworktypes.Handle) (frameworktypes.Plugin, error) {
 	defaultEvictorArgs, ok := args.(*DefaultEvictorArgs)
 	if !ok {
 		return nil, fmt.Errorf("want args to be of type defaultEvictorFilterArgs, got %T", args)
 	}
+	logger := klog.FromContext(ctx).WithValues("plugin", PluginName)
 
 	ev := &DefaultEvictor{
+		logger: logger,
 		handle: handle,
 		args:   defaultEvictorArgs,
 	}
+	// add constraints
+	err := ev.addAllConstraints(logger, handle)
+	if err != nil {
+		return nil, err
+	}
+	return ev, nil
+}
 
-	if defaultEvictorArgs.EvictFailedBarePods {
-		klog.V(1).InfoS("Warning: EvictFailedBarePods is set to True. This could cause eviction of pods without ownerReferences.")
-		ev.constraints = append(ev.constraints, func(pod *v1.Pod) error {
+func (d *DefaultEvictor) addAllConstraints(logger klog.Logger, handle frameworktypes.Handle) error {
+	args := d.args
+	// Determine effective protected policies based on the provided arguments.
+	effectivePodProtections := getEffectivePodProtections(args)
+
+	if err := applyEffectivePodProtections(d, effectivePodProtections, handle); err != nil {
+		return fmt.Errorf("failed to apply effective protected policies: %w", err)
+	}
+	if constraints, err := evictionConstraintsForLabelSelector(logger, args.LabelSelector); err != nil {
+		return err
+	} else {
+		d.constraints = append(d.constraints, constraints...)
+	}
+	if constraints, err := evictionConstraintsForMinReplicas(logger, args.MinReplicas, handle); err != nil {
+		return err
+	} else {
+		d.constraints = append(d.constraints, constraints...)
+	}
+	d.constraints = append(d.constraints, evictionConstraintsForMinPodAge(args.MinPodAge)...)
+	return nil
+}
+
+// applyEffectivePodProtections configures the evictor with specified Pod protection.
+func applyEffectivePodProtections(d *DefaultEvictor, podProtections []PodProtection, handle frameworktypes.Handle) error {
+	protectionMap := make(map[PodProtection]bool, len(podProtections))
+	for _, protection := range podProtections {
+		protectionMap[protection] = true
+	}
+
+	// Apply protections
+	if err := applySystemCriticalPodsProtection(d, protectionMap, handle); err != nil {
+		return err
+	}
+	applyFailedBarePodsProtection(d, protectionMap)
+	applyLocalStoragePodsProtection(d, protectionMap)
+	applyDaemonSetPodsProtection(d, protectionMap)
+	applyPvcPodsProtection(d, protectionMap)
+	applyPodsWithoutPDBProtection(d, protectionMap, handle)
+	applyPodsWithResourceClaimsProtection(d, protectionMap)
+
+	return nil
+}
+
+func applyFailedBarePodsProtection(d *DefaultEvictor, protectionMap map[PodProtection]bool) {
+	isProtectionEnabled := protectionMap[FailedBarePods]
+	if !isProtectionEnabled {
+		d.logger.V(1).Info("Warning: EvictFailedBarePods is set to True. This could cause eviction of pods without ownerReferences.")
+		d.constraints = append(d.constraints, func(pod *v1.Pod) error {
 			ownerRefList := podutil.OwnerRef(pod)
-			// Enable evictFailedBarePods to evict bare pods in failed phase
 			if len(ownerRefList) == 0 && pod.Status.Phase != v1.PodFailed {
 				return fmt.Errorf("pod does not have any ownerRefs and is not in failed phase")
 			}
 			return nil
 		})
 	} else {
-		ev.constraints = append(ev.constraints, func(pod *v1.Pod) error {
-			ownerRefList := podutil.OwnerRef(pod)
-			if len(ownerRefList) == 0 {
+		d.constraints = append(d.constraints, func(pod *v1.Pod) error {
+			if len(podutil.OwnerRef(pod)) == 0 {
 				return fmt.Errorf("pod does not have any ownerRefs")
 			}
 			return nil
 		})
 	}
-	if !defaultEvictorArgs.EvictSystemCriticalPods {
-		ev.constraints = append(ev.constraints, func(pod *v1.Pod) error {
-			if utils.IsCriticalPriorityPod(pod) {
-				return fmt.Errorf("pod has system critical priority")
-			}
-			return nil
-		})
+}
 
-		if defaultEvictorArgs.PriorityThreshold != nil && (defaultEvictorArgs.PriorityThreshold.Value != nil || len(defaultEvictorArgs.PriorityThreshold.Name) > 0) {
-			thresholdPriority, err := utils.GetPriorityValueFromPriorityThreshold(context.TODO(), handle.ClientSet(), defaultEvictorArgs.PriorityThreshold)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get priority threshold: %v", err)
-			}
-			ev.constraints = append(ev.constraints, func(pod *v1.Pod) error {
-				if IsPodEvictableBasedOnPriority(pod, thresholdPriority) {
-					return nil
-				}
-				return fmt.Errorf("pod has higher priority than specified priority class threshold")
-			})
-		}
-	} else {
-		klog.V(1).InfoS("Warning: EvictSystemCriticalPods is set to True. This could cause eviction of Kubernetes system pods.")
+func applySystemCriticalPodsProtection(d *DefaultEvictor, protectionMap map[PodProtection]bool, handle frameworktypes.Handle) error {
+	isProtectionEnabled := protectionMap[SystemCriticalPods]
+	if !isProtectionEnabled {
+		d.logger.V(1).Info("Warning: System critical pod protection is disabled. This could cause eviction of Kubernetes system pods.")
+		return nil
 	}
-	if !defaultEvictorArgs.EvictLocalStoragePods {
-		ev.constraints = append(ev.constraints, func(pod *v1.Pod) error {
-			if utils.IsPodWithLocalStorage(pod) {
-				return fmt.Errorf("pod has local storage and descheduler is not configured with evictLocalStoragePods")
+
+	d.constraints = append(d.constraints, func(pod *v1.Pod) error {
+		if utils.IsCriticalPriorityPod(pod) {
+			return fmt.Errorf("pod has system critical priority and is protected against eviction")
+		}
+		return nil
+	})
+
+	priorityThreshold := d.args.PriorityThreshold
+	if priorityThreshold != nil && (priorityThreshold.Value != nil || len(priorityThreshold.Name) > 0) {
+		thresholdPriority, err := utils.GetPriorityValueFromPriorityThreshold(context.TODO(), handle.ClientSet(), priorityThreshold)
+		if err != nil {
+			d.logger.Error(err, "failed to get priority threshold")
+			return err
+		}
+		d.constraints = append(d.constraints, func(pod *v1.Pod) error {
+			if !IsPodEvictableBasedOnPriority(pod, thresholdPriority) {
+				return fmt.Errorf("pod has higher priority than specified priority class threshold")
 			}
 			return nil
 		})
 	}
-	if !defaultEvictorArgs.EvictDaemonSetPods {
-		ev.constraints = append(ev.constraints, func(pod *v1.Pod) error {
+	return nil
+}
+
+func applyLocalStoragePodsProtection(d *DefaultEvictor, protectionMap map[PodProtection]bool) {
+	isProtectionEnabled := protectionMap[PodsWithLocalStorage]
+	if isProtectionEnabled {
+		d.constraints = append(d.constraints, func(pod *v1.Pod) error {
+			if utils.IsPodWithLocalStorage(pod) {
+				return fmt.Errorf("pod has local storage and is protected against eviction")
+			}
+			return nil
+		})
+	}
+}
+
+func applyDaemonSetPodsProtection(d *DefaultEvictor, protectionMap map[PodProtection]bool) {
+	isProtectionEnabled := protectionMap[DaemonSetPods]
+	if isProtectionEnabled {
+		d.constraints = append(d.constraints, func(pod *v1.Pod) error {
 			ownerRefList := podutil.OwnerRef(pod)
 			if utils.IsDaemonsetPod(ownerRefList) {
-				return fmt.Errorf("pod is related to daemonset and descheduler is not configured with evictDaemonSetPods")
+				return fmt.Errorf("daemonset pods are protected against eviction")
 			}
 			return nil
 		})
 	}
-	if defaultEvictorArgs.IgnorePvcPods {
-		ev.constraints = append(ev.constraints, func(pod *v1.Pod) error {
+}
+
+func applyPvcPodsProtection(d *DefaultEvictor, protectionMap map[PodProtection]bool) {
+	isProtectionEnabled := protectionMap[PodsWithPVC]
+	if isProtectionEnabled {
+		d.constraints = append(d.constraints, func(pod *v1.Pod) error {
 			if utils.IsPodWithPVC(pod) {
-				return fmt.Errorf("pod has a PVC and descheduler is configured to ignore PVC pods")
+				return fmt.Errorf("pod with PVC is protected against eviction")
 			}
 			return nil
 		})
 	}
-	selector, err := metav1.LabelSelectorAsSelector(defaultEvictorArgs.LabelSelector)
-	if err != nil {
-		return nil, fmt.Errorf("could not get selector from label selector")
-	}
-	if defaultEvictorArgs.LabelSelector != nil && !selector.Empty() {
-		ev.constraints = append(ev.constraints, func(pod *v1.Pod) error {
-			if !selector.Matches(labels.Set(pod.Labels)) {
-				return fmt.Errorf("pod labels do not match the labelSelector filter in the policy parameter")
-			}
-			return nil
-		})
-	}
+}
 
-	if defaultEvictorArgs.MinReplicas > 1 {
-		indexName := "metadata.ownerReferences"
-		indexer, err := getPodIndexerByOwnerRefs(indexName, handle)
-		if err != nil {
-			return nil, err
-		}
-		ev.constraints = append(ev.constraints, func(pod *v1.Pod) error {
-			if len(pod.OwnerReferences) == 0 {
-				return nil
-			}
-
-			if len(pod.OwnerReferences) > 1 {
-				klog.V(5).InfoS("pod has multiple owner references which is not supported for minReplicas check", "size", len(pod.OwnerReferences), "pod", klog.KObj(pod))
-				return nil
-			}
-
-			ownerRef := pod.OwnerReferences[0]
-			objs, err := indexer.ByIndex(indexName, string(ownerRef.UID))
-			if err != nil {
-				return fmt.Errorf("unable to list pods for minReplicas filter in the policy parameter")
-			}
-
-			if uint(len(objs)) < defaultEvictorArgs.MinReplicas {
-				return fmt.Errorf("owner has %d replicas which is less than minReplicas of %d", len(objs), defaultEvictorArgs.MinReplicas)
-			}
-
-			return nil
-		})
-	}
-
-	if defaultEvictorArgs.MinPodAge != nil {
-		ev.constraints = append(ev.constraints, func(pod *v1.Pod) error {
-			if pod.Status.StartTime == nil || time.Since(pod.Status.StartTime.Time) < defaultEvictorArgs.MinPodAge.Duration {
-				return fmt.Errorf("pod age is not older than MinPodAge: %s seconds", defaultEvictorArgs.MinPodAge.String())
-			}
-			return nil
-		})
-	}
-
-	if defaultEvictorArgs.IgnorePodsWithoutPDB {
-		ev.constraints = append(ev.constraints, func(pod *v1.Pod) error {
+func applyPodsWithoutPDBProtection(d *DefaultEvictor, protectionMap map[PodProtection]bool, handle frameworktypes.Handle) {
+	isProtectionEnabled := protectionMap[PodsWithoutPDB]
+	if isProtectionEnabled {
+		d.constraints = append(d.constraints, func(pod *v1.Pod) error {
 			hasPdb, err := utils.IsPodCoveredByPDB(pod, handle.SharedInformerFactory().Policy().V1().PodDisruptionBudgets().Lister())
 			if err != nil {
 				return fmt.Errorf("unable to check if pod is covered by PodDisruptionBudget: %w", err)
 			}
 			if !hasPdb {
-				return fmt.Errorf("no PodDisruptionBudget found for pod")
+				return fmt.Errorf("pod does not have a PodDisruptionBudget and is protected against eviction")
 			}
 			return nil
 		})
 	}
+}
 
-	return ev, nil
+func applyPodsWithResourceClaimsProtection(d *DefaultEvictor, protectionMap map[PodProtection]bool) {
+	isProtectionEnabled := protectionMap[PodsWithResourceClaims]
+	if isProtectionEnabled {
+		d.constraints = append(d.constraints, func(pod *v1.Pod) error {
+			if utils.IsPodWithResourceClaims(pod) {
+				return fmt.Errorf("pod has ResourceClaims and descheduler is configured to protect ResourceClaims pods")
+			}
+			return nil
+		})
+	}
+}
+
+// getEffectivePodProtections determines which policies are currently active.
+// It supports both new-style (PodProtections) and legacy-style flags.
+func getEffectivePodProtections(args *DefaultEvictorArgs) []PodProtection {
+	// determine whether to use PodProtections config
+	useNewConfig := len(args.PodProtections.DefaultDisabled) > 0 || len(args.PodProtections.ExtraEnabled) > 0
+
+	if !useNewConfig {
+		// fall back to the Deprecated config
+		return legacyGetPodProtections(args)
+	}
+
+	// effective is the final list of active protection.
+	effective := make([]PodProtection, 0)
+	effective = append(effective, defaultPodProtections...)
+
+	// Remove PodProtections that are in the DefaultDisabled list.
+	effective = slices.DeleteFunc(effective, func(protection PodProtection) bool {
+		return slices.Contains(args.PodProtections.DefaultDisabled, protection)
+	})
+
+	// Add extra enabled in PodProtections
+	effective = append(effective, args.PodProtections.ExtraEnabled...)
+
+	return effective
+}
+
+// legacyGetPodProtections returns protections using deprecated boolean flags.
+func legacyGetPodProtections(args *DefaultEvictorArgs) []PodProtection {
+	var protections []PodProtection
+
+	// defaultDisabled
+	if !args.EvictLocalStoragePods {
+		protections = append(protections, PodsWithLocalStorage)
+	}
+	if !args.EvictDaemonSetPods {
+		protections = append(protections, DaemonSetPods)
+	}
+	if !args.EvictSystemCriticalPods {
+		protections = append(protections, SystemCriticalPods)
+	}
+	if !args.EvictFailedBarePods {
+		protections = append(protections, FailedBarePods)
+	}
+
+	// extraEnabled
+	if args.IgnorePvcPods {
+		protections = append(protections, PodsWithPVC)
+	}
+	if args.IgnorePodsWithoutPDB {
+		protections = append(protections, PodsWithoutPDB)
+	}
+	return protections
 }
 
 // Name retrieves the plugin name
@@ -220,14 +306,15 @@ func (d *DefaultEvictor) Name() string {
 }
 
 func (d *DefaultEvictor) PreEvictionFilter(pod *v1.Pod) bool {
+	logger := d.logger.WithValues("ExtensionPoint", frameworktypes.PreEvictionFilterExtensionPoint)
 	if d.args.NodeFit {
 		nodes, err := nodeutil.ReadyNodes(context.TODO(), d.handle.ClientSet(), d.handle.SharedInformerFactory().Core().V1().Nodes().Lister(), d.args.NodeSelector)
 		if err != nil {
-			klog.ErrorS(err, "unable to list ready nodes", "pod", klog.KObj(pod))
+			logger.Error(err, "unable to list ready nodes", "pod", klog.KObj(pod))
 			return false
 		}
 		if !nodeutil.PodFitsAnyOtherNode(d.handle.GetPodsAssignedToNodeFunc(), pod, nodes) {
-			klog.InfoS("pod does not fit on any other node because of nodeSelector(s), Taint(s), or nodes marked as unschedulable", "pod", klog.KObj(pod))
+			logger.Info("pod does not fit on any other node because of nodeSelector(s), Taint(s), or nodes marked as unschedulable", "pod", klog.KObj(pod))
 			return false
 		}
 		return true
@@ -236,6 +323,7 @@ func (d *DefaultEvictor) PreEvictionFilter(pod *v1.Pod) bool {
 }
 
 func (d *DefaultEvictor) Filter(pod *v1.Pod) bool {
+	logger := d.logger.WithValues("ExtensionPoint", frameworktypes.FilterExtensionPoint)
 	checkErrs := []error{}
 
 	if HaveEvictAnnotation(pod) {
@@ -265,7 +353,7 @@ func (d *DefaultEvictor) Filter(pod *v1.Pod) bool {
 	}
 
 	if len(checkErrs) > 0 {
-		klog.V(4).InfoS("Pod fails the following checks", "pod", klog.KObj(pod), "checks", utilerrors.NewAggregate(checkErrs).Error())
+		logger.V(4).Info("Pod fails the following checks", "pod", klog.KObj(pod), "checks", utilerrors.NewAggregate(checkErrs).Error())
 		return false
 	}
 

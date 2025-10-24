@@ -46,6 +46,7 @@ var _ fwtypes.DeschedulePlugin = &Example{}
 // Example is our plugin (implementing the DeschedulePlugin interface). This
 // plugin will evict pods that match a regex and are older than a certain age.
 type Example struct {
+	logger    klog.Logger
 	handle    fwtypes.Handle
 	args      *ExampleArgs
 	podFilter podutil.FilterFunc
@@ -55,12 +56,13 @@ type Example struct {
 // a runtime.Object. Handle is used by plugins to retrieve a kubernetes client
 // set, evictor interface, shared informer factory and other instruments shared
 // across different plugins.
-func New(args runtime.Object, handle fwtypes.Handle) (fwtypes.Plugin, error) {
+func New(ctx context.Context, args runtime.Object, handle fwtypes.Handle) (fwtypes.Plugin, error) {
 	// make sure we are receiving the right argument type.
 	exampleArgs, ok := args.(*ExampleArgs)
 	if !ok {
 		return nil, fmt.Errorf("args must be of type ExampleArgs, got %T", args)
 	}
+	logger := klog.FromContext(ctx).WithValues("plugin", PluginName)
 
 	// we can use the included and excluded namespaces to filter the pods we want
 	// to evict.
@@ -90,6 +92,7 @@ func New(args runtime.Object, handle fwtypes.Handle) (fwtypes.Plugin, error) {
 	}
 
 	return &Example{
+		logger:    logger,
 		handle:    handle,
 		podFilter: podFilter,
 		args:      exampleArgs,
@@ -107,7 +110,7 @@ func (d *Example) Name() string {
 // of nodes we need to process.
 func (d *Example) Deschedule(ctx context.Context, nodes []*v1.Node) *fwtypes.Status {
 	var podsToEvict []*v1.Pod
-	logger := klog.FromContext(ctx)
+	logger := klog.FromContext(klog.NewContext(ctx, d.logger)).WithValues("ExtensionPoint", fwtypes.DescheduleExtensionPoint)
 	logger.Info("Example plugin starting descheduling")
 
 	re, err := regexp.Compile(d.args.Regex)
@@ -137,10 +140,23 @@ func (d *Example) Deschedule(ctx context.Context, nodes []*v1.Node) *fwtypes.Sta
 
 	// go node by node getting all pods that we can evict.
 	for _, node := range nodes {
-		// ListAllPodsOnANode is a helper function that retrieves all
-		// pods filtering out the ones we can't evict. We merge the
-		// default filters with the one we created above.
-		pods, err := podutil.ListAllPodsOnANode(
+		// ListAllPodsOnANode is a helper function that retrieves all pods filtering out the ones we can't evict.
+		// ListPodsOnANode is a helper function that retrieves all pods(excluding Succeeded or Failed phases) filtering out the ones we can't evict.
+		// We merge the default filters with the one we created above.
+		//
+		// The difference between ListPodsOnANode and ListAllPodsOnANode lies in their handling of Pods based on their phase:
+		// - ListPodsOnANode excludes Pods that are in Succeeded or Failed phases because they do not occupy any resources.
+		// - ListAllPodsOnANode does not exclude Pods based on their phase, listing all Pods regardless of their state.
+		//
+		// In this context, we prefer using ListPodsOnANode because:
+		// 1. It ensures that only active Pods (not in Succeeded or Failed states) are considered for eviction.
+		// 2. This helps avoid unnecessary processing of Pods that no longer consume resources.
+		// 3. By applying an additional filter (d.podFilter and filter), we can further refine which Pods are eligible for eviction,
+		//    ensuring that only Pods meeting specific criteria are selected.
+		//
+		// However, if you need to consider all Pods including those in Succeeded or Failed states for other purposes,
+		// you should use ListAllPodsOnANode instead.
+		pods, err := podutil.ListPodsOnANode(
 			node.Name,
 			d.handle.GetPodsAssignedToNodeFunc(),
 			podutil.WrapFilterFuncs(d.podFilter, filter),

@@ -42,6 +42,12 @@ import (
 	"sigs.k8s.io/descheduler/pkg/tracing"
 )
 
+const (
+	deschedulerGlobalName    = "sigs.k8s.io/descheduler"
+	reasonAnnotationKey      = "reason"
+	requestedByAnnotationKey = "requested-by"
+)
+
 var (
 	assumedEvictionRequestTimeoutSeconds uint          = 10 * 60 // 10 minutes
 	evictionRequestsCacheResyncPeriod    time.Duration = 10 * time.Minute
@@ -482,6 +488,7 @@ func (pe *PodEvictor) EvictPod(ctx context.Context, pod *v1.Pod, opts EvictOptio
 		err := NewEvictionTotalLimitError()
 		if pe.metricsEnabled {
 			metrics.PodsEvicted.With(map[string]string{"result": err.Error(), "strategy": opts.StrategyName, "namespace": pod.Namespace, "node": pod.Spec.NodeName, "profile": opts.ProfileName}).Inc()
+			metrics.PodsEvictedTotal.With(map[string]string{"result": err.Error(), "strategy": opts.StrategyName, "namespace": pod.Namespace, "node": pod.Spec.NodeName, "profile": opts.ProfileName}).Inc()
 		}
 		span.AddEvent("Eviction Failed", trace.WithAttributes(attribute.String("node", pod.Spec.NodeName), attribute.String("err", err.Error())))
 		klog.ErrorS(err, "Error evicting pod", "limit", *pe.maxPodsToEvictTotal)
@@ -496,6 +503,7 @@ func (pe *PodEvictor) EvictPod(ctx context.Context, pod *v1.Pod, opts EvictOptio
 			err := NewEvictionNodeLimitError(pod.Spec.NodeName)
 			if pe.metricsEnabled {
 				metrics.PodsEvicted.With(map[string]string{"result": err.Error(), "strategy": opts.StrategyName, "namespace": pod.Namespace, "node": pod.Spec.NodeName, "profile": opts.ProfileName}).Inc()
+				metrics.PodsEvictedTotal.With(map[string]string{"result": err.Error(), "strategy": opts.StrategyName, "namespace": pod.Namespace, "node": pod.Spec.NodeName, "profile": opts.ProfileName}).Inc()
 			}
 			span.AddEvent("Eviction Failed", trace.WithAttributes(attribute.String("node", pod.Spec.NodeName), attribute.String("err", err.Error())))
 			klog.ErrorS(err, "Error evicting pod", "limit", *pe.maxPodsToEvictPerNode, "node", pod.Spec.NodeName)
@@ -510,6 +518,7 @@ func (pe *PodEvictor) EvictPod(ctx context.Context, pod *v1.Pod, opts EvictOptio
 		err := NewEvictionNamespaceLimitError(pod.Namespace)
 		if pe.metricsEnabled {
 			metrics.PodsEvicted.With(map[string]string{"result": err.Error(), "strategy": opts.StrategyName, "namespace": pod.Namespace, "node": pod.Spec.NodeName, "profile": opts.ProfileName}).Inc()
+			metrics.PodsEvictedTotal.With(map[string]string{"result": err.Error(), "strategy": opts.StrategyName, "namespace": pod.Namespace, "node": pod.Spec.NodeName, "profile": opts.ProfileName}).Inc()
 		}
 		span.AddEvent("Eviction Failed", trace.WithAttributes(attribute.String("node", pod.Spec.NodeName), attribute.String("err", err.Error())))
 		klog.ErrorS(err, "Error evicting pod", "limit", *pe.maxPodsToEvictPerNamespace, "namespace", pod.Namespace, "pod", klog.KObj(pod))
@@ -519,13 +528,14 @@ func (pe *PodEvictor) EvictPod(ctx context.Context, pod *v1.Pod, opts EvictOptio
 		return err
 	}
 
-	ignore, err := pe.evictPod(ctx, pod)
+	ignore, err := pe.evictPod(ctx, pod, opts)
 	if err != nil {
 		// err is used only for logging purposes
 		span.AddEvent("Eviction Failed", trace.WithAttributes(attribute.String("node", pod.Spec.NodeName), attribute.String("err", err.Error())))
 		klog.ErrorS(err, "Error evicting pod", "pod", klog.KObj(pod), "reason", opts.Reason)
 		if pe.metricsEnabled {
 			metrics.PodsEvicted.With(map[string]string{"result": "error", "strategy": opts.StrategyName, "namespace": pod.Namespace, "node": pod.Spec.NodeName, "profile": opts.ProfileName}).Inc()
+			metrics.PodsEvictedTotal.With(map[string]string{"result": "error", "strategy": opts.StrategyName, "namespace": pod.Namespace, "node": pod.Spec.NodeName, "profile": opts.ProfileName}).Inc()
 		}
 		if pe.evictionFailureEventNotification {
 			pe.eventRecorder.Eventf(pod, nil, v1.EventTypeWarning, "EvictionFailed", "Descheduled", "pod eviction from %v node by sigs.k8s.io/descheduler failed: %v", pod.Spec.NodeName, err.Error())
@@ -545,6 +555,7 @@ func (pe *PodEvictor) EvictPod(ctx context.Context, pod *v1.Pod, opts EvictOptio
 
 	if pe.metricsEnabled {
 		metrics.PodsEvicted.With(map[string]string{"result": "success", "strategy": opts.StrategyName, "namespace": pod.Namespace, "node": pod.Spec.NodeName, "profile": opts.ProfileName}).Inc()
+		metrics.PodsEvictedTotal.With(map[string]string{"result": "success", "strategy": opts.StrategyName, "namespace": pod.Namespace, "node": pod.Spec.NodeName, "profile": opts.ProfileName}).Inc()
 	}
 
 	if pe.dryRun {
@@ -564,7 +575,7 @@ func (pe *PodEvictor) EvictPod(ctx context.Context, pod *v1.Pod, opts EvictOptio
 }
 
 // return (ignore, err)
-func (pe *PodEvictor) evictPod(ctx context.Context, pod *v1.Pod) (bool, error) {
+func (pe *PodEvictor) evictPod(ctx context.Context, pod *v1.Pod, opts EvictOptions) (bool, error) {
 	deleteOptions := &metav1.DeleteOptions{
 		GracePeriodSeconds: pe.gracePeriodSeconds,
 	}
@@ -577,6 +588,10 @@ func (pe *PodEvictor) evictPod(ctx context.Context, pod *v1.Pod) (bool, error) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      pod.Name,
 			Namespace: pod.Namespace,
+			Annotations: map[string]string{
+				"reason":       fmt.Sprintf("triggered by %v/%v: %v", opts.ProfileName, opts.StrategyName, opts.Reason),
+				"requested-by": deschedulerGlobalName,
+			},
 		},
 		DeleteOptions: deleteOptions,
 	}
